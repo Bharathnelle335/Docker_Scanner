@@ -39,13 +39,15 @@ jobs:
       run: docker pull "${{ github.event.inputs.docker_image }}"
 
     - name: 🐳 Load *.tar inside ZIP as image (if present)
-      if: |
-        github.event.inputs.input_type == 'zip' &&
-        (find extracted -name '*.tar' | grep -q .)
-      run: |
-        docker load -i $(find extracted -name '*.tar' | head -n1) \
-        | awk '{print $3}' > image_id.txt
-        docker tag $(cat image_id.txt) "$IMG_NAME:latest"
+  if: github.event.inputs.input_type == 'zip'
+  run: |
+    tarfile=$(find extracted -name '*.tar' | head -n1 || true)
+    if [[ -f "$tarfile" ]]; then
+      docker load -i "$tarfile" | awk '{print $3}' > image_id.txt
+      docker tag $(cat image_id.txt) "$IMG_NAME:latest"
+    else
+      echo "No .tar file found inside ZIP, skipping image load."
+    fi
 
     # ─────────────── 2. DECIDE SCAN TARGET ───────────────
     - name: 📌 Set TARGET_* env vars

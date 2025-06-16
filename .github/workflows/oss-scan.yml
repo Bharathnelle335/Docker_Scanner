@@ -27,9 +27,6 @@ jobs:
       IMG_NAME: loaded-image
     steps:
 
-    #-------------------------------------------------
-    # 1. FETCH INPUT
-    #-------------------------------------------------
     - uses: actions/checkout@v4
 
     - name: ⬇️  Download ZIP
@@ -42,15 +39,11 @@ jobs:
       if: ${{ github.event.inputs.input_type == 'docker' }}
       run: docker pull "${{ github.event.inputs.docker_image }}"
 
-    #-------------------------------------------------
-    # 2. DETERMINE TARGET & LOAD TARBALL IF PRESENT
-    #-------------------------------------------------
     - name: 📌 Decide scan target
       id: target
       run: |
         echo "is_image=false"            >>"$GITHUB_OUTPUT"
         echo "target_dir=$PWD/extracted" >>"$GITHUB_OUTPUT"
-
         if [[ "${{ github.event.inputs.input_type }}" == "docker" ]]; then
           echo "is_image=true"                             >>"$GITHUB_OUTPUT"
           echo "target_image=${{ github.event.inputs.docker_image }}" >>"$GITHUB_OUTPUT"
@@ -61,12 +54,11 @@ jobs:
           echo "target_image=$IMG_NAME:latest" >>"$GITHUB_OUTPUT"
         fi
 
-    #-------------------------------------------------
-    # 3. RUN SCANNERS
-    #-------------------------------------------------
     - name: 📝 Install Syft
-      run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | \
-           sh -s -- -b /usr/local/bin
+      continue-on-error: true
+      run: |
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh -o install_syft.sh
+        bash install_syft.sh -b /usr/local/bin
 
     - name: 📝 Syft SBOM
       continue-on-error: true
@@ -95,18 +87,13 @@ jobs:
         else
           cp -r "${{ steps.target.outputs.target_dir }}/." fsroot/
         fi
-        docker run --rm -v "$PWD/fsroot":/scan scanoss/scanoss-toolkit scan \
-          -o scanoss_output.json /scan
+        docker run --rm -v "$PWD/fsroot":/scan scanoss/scanoss-toolkit scan           -o scanoss_output.json /scan
 
     - name: 📝 Docker Scout (optional)
       if: ${{ steps.target.outputs.is_image == 'true' && github.event.inputs.run_scout == 'true' }}
       continue-on-error: true
-      run: docker scout quickview "${{ steps.target.outputs.target_image }}" \
-           --output json > scout_output.json
+      run: docker scout quickview "${{ steps.target.outputs.target_image }}"            --output json > scout_output.json
 
-    #-------------------------------------------------
-    # 4. BUILD EXCEL SUMMARY
-    #-------------------------------------------------
     - name: 🗃️  Set up Python
       uses: actions/setup-python@v5
       with:
@@ -133,9 +120,6 @@ jobs:
                     df.to_excel(xl, sheet_name=name[:31], index=False)
         PY
 
-    #-------------------------------------------------
-    # 5. PUBLISH RESULTS
-    #-------------------------------------------------
     - name: 📤 Upload artefacts
       uses: actions/upload-artifact@v4
       with:

@@ -73,7 +73,12 @@ jobs:
       if: ${{ steps.target.outputs.is_image == 'true' }}
       continue-on-error: true
       run: |
-        sudo pip install --quiet tern
+        sudo apt update
+        sudo apt install -y python3.10 python3.10-venv
+        python3.10 -m venv tern-venv
+        source tern-venv/bin/activate
+        pip install --upgrade pip
+        pip install tern
         tern report -i "${{ steps.target.outputs.target_image }}" -o tern_output.json
 
     - name: 📝 SCANOSS file-level scan
@@ -87,17 +92,18 @@ jobs:
         else
           cp -r "${{ steps.target.outputs.target_dir }}/." fsroot/
         fi
-        docker run --rm -v "$PWD/fsroot":/scan scanoss/scanoss-toolkit scan           -o scanoss_output.json /scan
+        docker run --rm -v "$PWD/fsroot":/scan ghcr.io/scanoss/scanoss-toolkit scan           -o scanoss_output.json /scan
 
     - name: 📝 Docker Scout (optional)
       if: ${{ steps.target.outputs.is_image == 'true' && github.event.inputs.run_scout == 'true' }}
       continue-on-error: true
-      run: docker scout quickview "${{ steps.target.outputs.target_image }}"            --output json > scout_output.json
+      run: |
+        docker scout quickview "${{ steps.target.outputs.target_image }}" --format json > scout_output.json
 
     - name: 🗃️  Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.11"
+        python-version: "3.10"
 
     - name: 🗃️  Install Excel deps
       run: pip install --quiet pandas openpyxl

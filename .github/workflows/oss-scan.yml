@@ -53,8 +53,9 @@ jobs:
 
     # 2 — Pull or prepare input
     - name: Pull image
-      if: ${{ inputs.scan_type == 'docker' }}
+      if: ${{ inputs.scan_type == 'docker' && inputs.docker_image != '' }}
       run: docker pull "${{ inputs.docker_image }}"
+
 
     - name: Save & extract docker rootfs
       if: ${{ inputs.scan_type == 'docker' }}

@@ -1,166 +1,159 @@
-name: OSS Compliance Scan
+name: OSS Compliance – Syft | SCANOSS | ScanCode
 
 on:
   workflow_dispatch:
     inputs:
-      input_type:
-        description: "zip → give ZIP URL • docker → give image reference"
+      scan_type:
+        description: "docker | git | upload-zip | upload-tar | local"
+        required: true
+        default: docker
         type: choice
-        options: ["zip", "docker"]
-        default: "zip"
-      zip_url:
-        description: "Public ZIP URL (required if input_type=zip)"
-        required: false
+        options: [docker, git, upload-zip, upload-tar, local]
+
       docker_image:
-        description: "Image ref, e.g. ghcr.io/org/img:tag (required if input_type=docker)"
+        description: "Docker image name (required when scan_type=docker)"
         required: false
-      run_scout:
-        description: "Also run Docker Scout?"
+      git_url:
+        description: "Git repo URL (required when scan_type=git)"
+        required: false
+
+      enable_syft:
         type: boolean
-        default: false
+        default: true
+        description: "Run Syft SBOM?"
+      enable_scanoss:
+        type: boolean
+        default: true
+        description: "Run SCANOSS scan?"
+      enable_scancode:
+        type: boolean
+        default: true
+        description: "Run ScanCode Toolkit scan?"
 
 jobs:
-  scan:
+  compliance:
     runs-on: ubuntu-latest
-    env:
-      ZIP_PATH: input.zip
-      IMG_NAME: loaded-image
+
     steps:
+    # ───────────────── 0. Checkout ─────────────────
+    - uses: actions/checkout@v4
 
-    # ── 0. Login to GHCR (needed for other GHCR images, keep as-is)
-    - name: 🔐 Login to GHCR
-      uses: docker/login-action@v3
+    # ───────────────── 1. Toolchain ─────────────────
+    - name: Set up Python
+      uses: actions/setup-python@v5
       with:
-        registry: ghcr.io
-        username: ${{ secrets.REG_USERNAME }}
-        password: ${{ secrets.REG_TOKEN }}
+        python-version: "3.10"
 
-    # ── 0b. Login to Docker Hub  << NEW
-    - name: 🔐 Login to Docker Hub
+    - name: Install SCANOSS CLI, Syft, Excel libs
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install --user scanoss pandas openpyxl
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | \
+          sh -s -- -b /usr/local/bin
+
+    # ─────────────── 2. Input handling ───────────────
+    - name: Pull Docker image
+      if: ${{ inputs.scan_type == 'docker' }}
+      run: docker pull "${{ inputs.docker_image }}"
+
+    - name: Save & extract Docker filesystem
+      if: ${{ inputs.scan_type == 'docker' }}
+      run: |
+        mkdir -p docker-rootfs
+        docker save "${{ inputs.docker_image }}" -o image.tar
+        tar -xf image.tar
+        find . -name 'layer.tar' -exec tar -xf {} -C docker-rootfs \;
+
+    - name: Clone Git repository
+      if: ${{ inputs.scan_type == 'git' }}
+      run: git clone --depth 1 "${{ inputs.git_url }}" repo-src
+
+    - name: Unzip uploaded ZIP
+      if: ${{ inputs.scan_type == 'upload-zip' }}
+      run: |
+        mkdir zip-src
+        unzip '*.zip' -d zip-src
+
+    - name: Extract uploaded TAR / TAR.GZ
+      if: ${{ inputs.scan_type == 'upload-tar' }}
+      run: |
+        mkdir tar-rootfs
+        file=$(find . -maxdepth 1 -type f -iname "*.tar*" | head -n1)
+        [ -z "$file" ] && { echo "❌ No .tar archive found."; exit 1; }
+        tar -xf "$file" -C tar-rootfs
+
+    # ─────────────── 3. SCANOSS CLI ───────────────
+    - name: Run SCANOSS
+      if: ${{ inputs.enable_scanoss }}
+      run: |
+        case "${{ inputs.scan_type }}" in
+          docker)      SRC=docker-rootfs ;;
+          upload-tar)  SRC=tar-rootfs    ;;
+          upload-zip)  SRC=zip-src       ;;
+          git)         SRC=repo-src      ;;
+          local)       SRC=.             ;;
+        esac
+        python -m scanoss.cli scan -o scanoss.json "$SRC"
+
+    # ─────────────── 4. Syft SBOM ───────────────
+    - name: Run Syft
+      if: ${{ inputs.enable_syft }}
+      run: |
+        OUT=syft.spdx.json
+        case "${{ inputs.scan_type }}" in
+          docker)      syft "${{ inputs.docker_image }}"        -o spdx-json > "$OUT" ;;
+          upload-tar)  syft dir:tar-rootfs                      -o spdx-json > "$OUT" ;;
+          upload-zip)  syft dir:zip-src                         -o spdx-json > "$OUT" ;;
+          git)         syft dir:repo-src                        -o spdx-json > "$OUT" ;;
+          local)       syft dir:.                               -o spdx-json > "$OUT" ;;
+        esac
+
+    # ─────────────── 5. ScanCode Toolkit ───────────────
+    - name: Docker login (Docker Hub)           # requires DOCKERHUB_USER / DOCKERHUB_TOKEN secrets
+      if: ${{ inputs.enable_scancode }}
       uses: docker/login-action@v3
       with:
         username: ${{ secrets.DOCKERHUB_USER }}
         password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-    # ── 1. Fetch source
-    - uses: actions/checkout@v4
-
-    - name: ⬇️ Download ZIP
-      if: ${{ github.event.inputs.input_type == 'zip' }}
+    - name: Run ScanCode Toolkit
+      if: ${{ inputs.enable_scancode }}
       run: |
-        curl -Lf "${{ github.event.inputs.zip_url }}" -o "$ZIP_PATH"
-        unzip -q "$ZIP_PATH" -d extracted
-
-    - name: 🐳 Pull image
-      if: ${{ github.event.inputs.input_type == 'docker' }}
-      run: docker pull "${{ github.event.inputs.docker_image }}"
-
-    # ── 2. Decide scan target
-    - name: 📌 Decide scan target
-      id: target
-      run: |
-        echo "is_image=false" >>"$GITHUB_OUTPUT"
-        echo "target_dir=$PWD/extracted" >>"$GITHUB_OUTPUT"
-
-        if [[ "${{ github.event.inputs.input_type }}" == "docker" ]]; then
-          echo "is_image=true" >>"$GITHUB_OUTPUT"
-          echo "target_image=${{ github.event.inputs.docker_image }}" >>"$GITHUB_OUTPUT"
-        elif tar=$(find extracted -maxdepth 1 -name '*.tar' -print -quit); then
-          docker load -i "$tar" | awk '{print $3}' > id.txt
-          docker tag "$(cat id.txt)" "$IMG_NAME:latest"
-          echo "is_image=true" >>"$GITHUB_OUTPUT"
-          echo "target_image=$IMG_NAME:latest" >>"$GITHUB_OUTPUT"
-        fi
-
-    # ── 3. Syft
-    - name: 📝 Install Syft
-      continue-on-error: true
-      run: |
-        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh -o install_syft.sh
-        bash install_syft.sh -b /usr/local/bin
-
-    - name: 📝 Syft SBOM
-      continue-on-error: true
-      run: |
-        if [[ "${{ steps.target.outputs.is_image }}" == "true" ]]; then
-          syft "${{ steps.target.outputs.target_image }}" -o json > syft_output.json
-        else
-          syft "${{ steps.target.outputs.target_dir }}"   -o json > syft_output.json
-        fi
-
-    # ── 4. Extract filesystem once
-    - name: 🗂️ Extract filesystem (fsroot)
-      run: |
-        mkdir fsroot
-        if [[ "${{ steps.target.outputs.is_image }}" == "true" ]]; then
-          docker create --name tmp "${{ steps.target.outputs.target_image }}"
-          docker cp tmp:/ fsroot/
-          docker rm tmp
-        else
-          cp -r "${{ steps.target.outputs.target_dir }}"/. fsroot/
-        fi
-
-    # ── 5. SCANOSS (Docker Hub image)
-    - name: 📝 SCANOSS scan
-      continue-on-error: true
-      run: |
-        docker run --rm -v "$PWD/fsroot":/scan \
-          ghcr.io/scanoss/scanoss-toolkit:v3.6.6 \
-          scan -o /scan/../scanoss_output.json /scan
-
-    # ── 6. ScanCode Toolkit (Docker Hub image)
-    - name: 📝 ScanCode Toolkit
-      continue-on-error: true
-      run: |
-        docker run --rm -v "$PWD/fsroot":/code -v "$PWD":/out \
+        case "${{ inputs.scan_type }}" in
+          docker)      SRC=docker-rootfs ;;
+          upload-tar)  SRC=tar-rootfs    ;;
+          upload-zip)  SRC=zip-src       ;;
+          git)         SRC=repo-src      ;;
+          local)       SRC=.             ;;
+        esac
+        docker run --rm -v "$PWD/$SRC":/code -v "$PWD":/out \
           nexb/scancode-toolkit:latest \
-          --json-pp /out/scancode_output.json /code
+          --json-pp /out/scancode.json /code
 
-    # ── 7. Docker Scout (optional)
-    - name: 📝 Docker Scout (optional)
-      if: ${{ steps.target.outputs.is_image == 'true' && github.event.inputs.run_scout == 'true' }}
-      continue-on-error: true
-      run: |
-        docker scout quickview "${{ steps.target.outputs.target_image }}" \
-          --format json > scout_output.json
-
-    # ── 8. Build Excel
-    - name: 🗃️ Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.10"
-
-    - name: 🗃️ Install Excel deps
-      run: pip install --quiet pandas openpyxl
-
-    - name: 🗃️ JSON → Excel
-      if: always()
+    # ─────────────── 6. Build Excel ───────────────
+    - name: Build Excel summary
       run: |
         python - <<'PY'
-        import json, glob, pandas as pd, sys
-        sheets = {}
-        for f in glob.glob("*_output.json"):
-            try:
-                with open(f, encoding="utf-8") as fp:
-                    data = json.load(fp)
-                sheets[f.replace("_output.json", "")] = pd.json_normalize(data)
-            except Exception as e:
-                print(f"⚠️ skipped {f}: {e}", file=sys.stderr)
-        if sheets:
-            with pd.ExcelWriter("compliance_report.xlsx") as xl:
-                for name, df in sheets.items():
-                    df.to_excel(xl, sheet_name=name[:31], index=False)
+        import json, glob, pandas as pd
+        files = [f for f in glob.glob("*.json") if not f.endswith(".spdx.json")]
+        if not files: exit()
+        with pd.ExcelWriter("report.xlsx") as xl:
+            for f in files:
+                try:
+                    df = pd.json_normalize(json.load(open(f)))
+                    df.to_excel(xl, sheet_name=f.split('.')[0][:31], index=False)
+                except Exception as e:
+                    print("skip", f, e)
         PY
 
-    # ── 9. Upload artefacts
-    - name: 📤 Upload artefacts
-      uses: actions/upload-artifact@v4
+    # ─────────────── 7. Upload artefacts ───────────────
+    - uses: actions/upload-artifact@v4
       with:
         name: oss-scan-results
         path: |
-          syft_output.json
-          scanoss_output.json
-          scancode_output.json
-          scout_output.json
-          compliance_report.xlsx
+          scanoss.json
+          scancode.json
+          syft.spdx.json
+          report.xlsx
         if-no-files-found: ignore

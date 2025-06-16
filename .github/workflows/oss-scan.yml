@@ -4,18 +4,18 @@ on:
   workflow_dispatch:
     inputs:
       input_type:
-        description: "zip → give a ZIP URL • docker → give an image reference"
+        description: "zip → give ZIP URL • docker → give image reference"
         type: choice
         options: ["zip", "docker"]
         default: "zip"
       zip_url:
-        description: "HTTP(S) URL of the ZIP (required if input_type=zip)"
+        description: "Public ZIP URL (required if input_type=zip)"
         required: false
       docker_image:
-        description: "Image reference, e.g. ghcr.io/org/app:tag (required if input_type=docker)"
+        description: "Image ref, e.g. ghcr.io/org/img:tag (required if input_type=docker)"
         required: false
       run_scout:
-        description: "Run Docker Scout step as well?"
+        description: "Also run Docker Scout?"
         type: boolean
         default: false
 
@@ -24,49 +24,46 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ZIP_PATH: input.zip
-      IMG_NAME: loaded-image          # temp tag when we load a tarball
+      IMG_NAME: loaded-image
     steps:
 
-    # --------------------------------------------------
-    # 1. FETCH THE INPUT
-    # --------------------------------------------------
+    #-------------------------------------------------
+    # 1. FETCH INPUT
+    #-------------------------------------------------
     - uses: actions/checkout@v4
 
-    - name: ⬇️  Download ZIP (input_type = zip)
+    - name: ⬇️  Download ZIP
       if: ${{ github.event.inputs.input_type == 'zip' }}
       run: |
         curl -Lf "${{ github.event.inputs.zip_url }}" -o "$ZIP_PATH"
         unzip -q "$ZIP_PATH" -d extracted
 
-    - name: 🐳 Pull image (input_type = docker)
+    - name: 🐳 Pull image
       if: ${{ github.event.inputs.input_type == 'docker' }}
       run: docker pull "${{ github.event.inputs.docker_image }}"
 
-    # --------------------------------------------------
-    # 2. DETERMINE TARGET & (optionally) LOAD .tar
-    # --------------------------------------------------
-    - name: 📌 Determine scan target & set outputs
+    #-------------------------------------------------
+    # 2. DETERMINE TARGET & LOAD TARBALL IF PRESENT
+    #-------------------------------------------------
+    - name: 📌 Decide scan target
       id: target
       run: |
-        echo "is_image=false"            >> "$GITHUB_OUTPUT"
-        echo "target_dir=$PWD/extracted" >> "$GITHUB_OUTPUT"
+        echo "is_image=false"            >>"$GITHUB_OUTPUT"
+        echo "target_dir=$PWD/extracted" >>"$GITHUB_OUTPUT"
 
-        # Case 1: user chose docker
         if [[ "${{ github.event.inputs.input_type }}" == "docker" ]]; then
-          echo "is_image=true"                          >> "$GITHUB_OUTPUT"
-          echo "target_image=${{ github.event.inputs.docker_image }}" >> "$GITHUB_OUTPUT"
-
-        # Case 2: ZIP contains a *.tar (docker save)
+          echo "is_image=true"                             >>"$GITHUB_OUTPUT"
+          echo "target_image=${{ github.event.inputs.docker_image }}" >>"$GITHUB_OUTPUT"
         elif tarfile=$(find extracted -maxdepth 1 -name '*.tar' -print -quit); then
-          docker load -i "$tarfile" | awk '{print $3}' > image_id.txt
-          docker tag "$(cat image_id.txt)" "$IMG_NAME:latest"
-          echo "is_image=true"            >> "$GITHUB_OUTPUT"
-          echo "target_image=$IMG_NAME:latest" >> "$GITHUB_OUTPUT"
+          docker load -i "$tarfile" | awk '{print $3}' >id.txt
+          docker tag "$(cat id.txt)" "$IMG_NAME:latest"
+          echo "is_image=true"            >>"$GITHUB_OUTPUT"
+          echo "target_image=$IMG_NAME:latest" >>"$GITHUB_OUTPUT"
         fi
 
-    # --------------------------------------------------
+    #-------------------------------------------------
     # 3. RUN SCANNERS
-    # --------------------------------------------------
+    #-------------------------------------------------
     - name: 📝 Install Syft
       run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | \
            sh -s -- -b /usr/local/bin
@@ -107,13 +104,16 @@ jobs:
       run: docker scout quickview "${{ steps.target.outputs.target_image }}" \
            --output json > scout_output.json
 
-    # --------------------------------------------------
+    #-------------------------------------------------
     # 4. BUILD EXCEL SUMMARY
-    # --------------------------------------------------
+    #-------------------------------------------------
     - name: 🗃️  Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: "3.11"
+
+    - name: 🗃️  Install Excel deps
+      run: pip install --quiet pandas openpyxl
 
     - name: 🗃️  JSON → Excel
       if: always()
@@ -124,8 +124,7 @@ jobs:
         for f in glob.glob("*_output.json"):
             try:
                 data=json.load(open(f, encoding="utf-8"))
-                df=pd.json_normalize(data)
-                sheets[f.replace("_output.json","")] = df
+                sheets[f.replace("_output.json","")] = pd.json_normalize(data)
             except Exception as e:
                 print("⚠️  skipped", f, e, file=sys.stderr)
         if sheets:
@@ -134,10 +133,10 @@ jobs:
                     df.to_excel(xl, sheet_name=name[:31], index=False)
         PY
 
-    # --------------------------------------------------
+    #-------------------------------------------------
     # 5. PUBLISH RESULTS
-    # --------------------------------------------------
-    - name: 📤 Upload scan artefacts
+    #-------------------------------------------------
+    - name: 📤 Upload artefacts
       uses: actions/upload-artifact@v4
       with:
         name: oss-scan-results

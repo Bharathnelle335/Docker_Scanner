@@ -27,22 +27,13 @@ jobs:
       IMG_NAME: loaded-image
     steps:
 
-    # ───────── 0. Login once for all private images ─────────
-    - name: 🔐 Docker login (GHCR + Docker Hub)
+    - name: 🔐 Docker login (GHCR only)
       uses: docker/login-action@v3
       with:
         registry: ghcr.io
         username: ${{ secrets.REG_USERNAME }}
         password: ${{ secrets.REG_TOKEN }}
 
-
-    - name: 🔐 Docker Hub login
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKERHUB_USER }}
-        password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-    # ───────── 1. Get the input ─────────
     - uses: actions/checkout@v4
 
     - name: ⬇️  Download ZIP
@@ -55,28 +46,25 @@ jobs:
       if: ${{ github.event.inputs.input_type == 'docker' }}
       run: docker pull "${{ github.event.inputs.docker_image }}"
 
-    # ───────── 2. Decide target & maybe load tar ─────────
     - name: 📌 Decide scan target
       id: target
       run: |
-        echo "is_image=false"            >>"$GITHUB_OUTPUT"
+        echo "is_image=false" >>"$GITHUB_OUTPUT"
         echo "target_dir=$PWD/extracted" >>"$GITHUB_OUTPUT"
         if [[ "${{ github.event.inputs.input_type }}" == "docker" ]]; then
-          echo "is_image=true"                             >>"$GITHUB_OUTPUT"
+          echo "is_image=true" >>"$GITHUB_OUTPUT"
           echo "target_image=${{ github.event.inputs.docker_image }}" >>"$GITHUB_OUTPUT"
         elif tarfile=$(find extracted -maxdepth 1 -name '*.tar' -print -quit); then
           docker load -i "$tarfile" | awk '{print $3}' > id.txt
           docker tag "$(cat id.txt)" "$IMG_NAME:latest"
-          echo "is_image=true"            >>"$GITHUB_OUTPUT"
+          echo "is_image=true" >>"$GITHUB_OUTPUT"
           echo "target_image=$IMG_NAME:latest" >>"$GITHUB_OUTPUT"
         fi
 
-    # ───────── 3. Syft ─────────
     - name: 📝 Install Syft
       continue-on-error: true
       run: |
-        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-             -o install_syft.sh
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh -o install_syft.sh
         bash install_syft.sh -b /usr/local/bin
 
     - name: 📝 Syft SBOM
@@ -85,45 +73,36 @@ jobs:
         if [[ "${{ steps.target.outputs.is_image }}" == "true" ]]; then
           syft "${{ steps.target.outputs.target_image }}" -o json > syft_output.json
         else
-          syft "${{ steps.target.outputs.target_dir }}"   -o json > syft_output.json
+          syft "${{ steps.target.outputs.target_dir }}" -o json > syft_output.json
         fi
 
-    # ───────── 4. Prepare fsroot once ─────────
     - name: 🗂️  Extract filesystem (fsroot)
       run: |
         mkdir fsroot
         if [[ "${{ steps.target.outputs.is_image }}" == "true" ]]; then
           docker create --name tmp "${{ steps.target.outputs.target_image }}"
           docker cp tmp:/ fsroot/
-          docker rm  tmp
+          docker rm tmp
         else
           cp -r "${{ steps.target.outputs.target_dir }}/." fsroot/
         fi
 
-    # ───────── 5. SCANOSS Toolkit (GHCR) ─────────
     - name: 📝 SCANOSS scan
       continue-on-error: true
       run: |
-        docker run --rm -v "$PWD/fsroot":/scan ghcr.io/scanoss/scanoss-toolkit:latest \
-          scan -o /scan/../scanoss_output.json /scan
+        docker run --rm -v "$PWD/fsroot":/scan ghcr.io/scanoss/scanoss-toolkit:latest scan -o /scan/../scanoss_output.json /scan
 
-    # ───────── 6. ScanCode Toolkit (GHCR) ─────────
     - name: 📝 ScanCode Toolkit
       continue-on-error: true
       run: |
-        docker run --rm -v "$PWD/fsroot":/code -v "$PWD":/out \
-          ghcr.io/nexb/scancode-toolkit:latest \
-          --json-pp /out/scancode_output.json /code
+        docker run --rm -v "$PWD/fsroot":/code -v "$PWD":/out ghcr.io/nexb/scancode-toolkit:latest --json-pp /out/scancode_output.json /code
 
-    # ───────── 7. Docker Scout (optional) ─────────
     - name: 📝 Docker Scout (optional)
       if: ${{ steps.target.outputs.is_image == 'true' && github.event.inputs.run_scout == 'true' }}
       continue-on-error: true
       run: |
-        docker scout quickview "${{ steps.target.outputs.target_image }}" \
-          --format json > scout_output.json
+        docker scout quickview "${{ steps.target.outputs.target_image }}" --format json > scout_output.json
 
-    # ───────── 8. Build Excel summary ─────────
     - name: 🗃️  Set up Python
       uses: actions/setup-python@v5
       with:
@@ -136,21 +115,20 @@ jobs:
       if: always()
       run: |
         python - <<'PY'
-        import json, glob, pandas as pd, sys
-        sheets={}
-        for f in glob.glob("*_output.json"):
-            try:
-                data=json.load(open(f, encoding="utf-8"))
-                sheets[f.replace("_output.json","")] = pd.json_normalize(data)
-            except Exception as e:
-                print("⚠️  skipped", f, e, file=sys.stderr)
-        if sheets:
-            with pd.ExcelWriter("compliance_report.xlsx") as xl:
-                for name,df in sheets.items():
-                    df.to_excel(xl, sheet_name=name[:31], index=False)
-        PY
+import json, glob, pandas as pd, sys
+sheets={}
+for f in glob.glob("*_output.json"):
+    try:
+        data=json.load(open(f, encoding="utf-8"))
+        sheets[f.replace("_output.json","")] = pd.json_normalize(data)
+    except Exception as e:
+        print("⚠️  skipped", f, e, file=sys.stderr)
+if sheets:
+    with pd.ExcelWriter("compliance_report.xlsx") as xl:
+        for name,df in sheets.items():
+            df.to_excel(xl, sheet_name=name[:31], index=False)
+PY
 
-    # ───────── 9. Upload artefacts ─────────
     - name: 📤 Upload artefacts
       uses: actions/upload-artifact@v4
       with:

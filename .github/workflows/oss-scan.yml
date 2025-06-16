@@ -3,8 +3,8 @@ name: OSS Compliance Scan
 on:
   workflow_dispatch:
     inputs:
-      input_type:       # ⇦ user must choose
-        description: "zip ➜ give a ZIP URL | docker ➜ give an image reference"
+      input_type:
+        description: "zip → give a ZIP URL • docker → give an image reference"
         type: choice
         options: ["zip", "docker"]
         default: "zip"
@@ -24,82 +24,93 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ZIP_PATH: input.zip
-      IMG_NAME: scanned-image          # temp tag if we load a tarball
+      IMG_NAME: loaded-image          # temp tag when we load a tarball
     steps:
 
-    # ─────────────── 1. FETCH THE INPUT ───────────────
-    - name: ⬇️  Download ZIP (when input_type=zip)
+    # --------------------------------------------------
+    # 1. FETCH THE INPUT
+    # --------------------------------------------------
+    - uses: actions/checkout@v4
+
+    - name: ⬇️  Download ZIP (input_type = zip)
       if: ${{ github.event.inputs.input_type == 'zip' }}
       run: |
         curl -Lf "${{ github.event.inputs.zip_url }}" -o "$ZIP_PATH"
         unzip -q "$ZIP_PATH" -d extracted
 
-    - name: 🐳 Pull image (when input_type=docker)
+    - name: 🐳 Pull image (input_type = docker)
       if: ${{ github.event.inputs.input_type == 'docker' }}
       run: docker pull "${{ github.event.inputs.docker_image }}"
 
-    - name: 🐳 Load *.tar inside ZIP as image (if present)
-  if: github.event.inputs.input_type == 'zip'
-  run: |
-    tarfile=$(find extracted -name '*.tar' | head -n1 || true)
-    if [[ -f "$tarfile" ]]; then
-      docker load -i "$tarfile" | awk '{print $3}' > image_id.txt
-      docker tag $(cat image_id.txt) "$IMG_NAME:latest"
-    else
-      echo "No .tar file found inside ZIP, skipping image load."
-    fi
-
-    # ─────────────── 2. DECIDE SCAN TARGET ───────────────
-    - name: 📌 Set TARGET_* env vars
+    # --------------------------------------------------
+    # 2. DETERMINE TARGET & (optionally) LOAD .tar
+    # --------------------------------------------------
+    - name: 📌 Determine scan target & set outputs
+      id: target
       run: |
+        echo "is_image=false"            >> "$GITHUB_OUTPUT"
+        echo "target_dir=$PWD/extracted" >> "$GITHUB_OUTPUT"
+
+        # Case 1: user chose docker
         if [[ "${{ github.event.inputs.input_type }}" == "docker" ]]; then
-          echo "TARGET_IMAGE=${{ github.event.inputs.docker_image }}" >> $GITHUB_ENV
-        elif find extracted -name '*.tar' | grep -q .; then
-          echo "TARGET_IMAGE=$IMG_NAME:latest" >> $GITHUB_ENV
-        else
-          echo "TARGET_DIR=$PWD/extracted" >> $GITHUB_ENV
+          echo "is_image=true"                          >> "$GITHUB_OUTPUT"
+          echo "target_image=${{ github.event.inputs.docker_image }}" >> "$GITHUB_OUTPUT"
+
+        # Case 2: ZIP contains a *.tar (docker save)
+        elif tarfile=$(find extracted -maxdepth 1 -name '*.tar' -print -quit); then
+          docker load -i "$tarfile" | awk '{print $3}' > image_id.txt
+          docker tag "$(cat image_id.txt)" "$IMG_NAME:latest"
+          echo "is_image=true"            >> "$GITHUB_OUTPUT"
+          echo "target_image=$IMG_NAME:latest" >> "$GITHUB_OUTPUT"
         fi
 
-    # ─────────────── 3. RUN SCANNERS ───────────────
+    # --------------------------------------------------
+    # 3. RUN SCANNERS
+    # --------------------------------------------------
+    - name: 📝 Install Syft
+      run: curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | \
+           sh -s -- -b /usr/local/bin
+
     - name: 📝 Syft SBOM
       continue-on-error: true
       run: |
-        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-        | sh -s -- -b /usr/local/bin
-        if [[ -n "$TARGET_IMAGE" ]]; then
-          syft "$TARGET_IMAGE" -o json > syft_output.json
+        if [[ "${{ steps.target.outputs.is_image }}" == "true" ]]; then
+          syft "${{ steps.target.outputs.target_image }}" -o json > syft_output.json
         else
-          syft "$TARGET_DIR" -o json > syft_output.json
+          syft "${{ steps.target.outputs.target_dir }}"   -o json > syft_output.json
         fi
 
-    - name: 📝 Tern SBOM (Docker images only)
-      if: ${{ env.TARGET_IMAGE != '' }}
+    - name: 📝 Tern SBOM (images only)
+      if: ${{ steps.target.outputs.is_image == 'true' }}
       continue-on-error: true
       run: |
         sudo pip install --quiet tern
-        tern report -i "$TARGET_IMAGE" -o tern_output.json
+        tern report -i "${{ steps.target.outputs.target_image }}" -o tern_output.json
 
     - name: 📝 SCANOSS file-level scan
       continue-on-error: true
       run: |
         mkdir fsroot
-        if [[ -n "$TARGET_IMAGE" ]]; then
-          docker create --name tmp "$TARGET_IMAGE"
+        if [[ "${{ steps.target.outputs.is_image }}" == "true" ]]; then
+          docker create --name tmp "${{ steps.target.outputs.target_image }}"
           docker cp tmp:/ fsroot/
-          docker rm tmp
+          docker rm  tmp
         else
-          cp -r "$TARGET_DIR"/. fsroot/
+          cp -r "${{ steps.target.outputs.target_dir }}/." fsroot/
         fi
         docker run --rm -v "$PWD/fsroot":/scan scanoss/scanoss-toolkit scan \
           -o scanoss_output.json /scan
 
     - name: 📝 Docker Scout (optional)
-      if: ${{ github.event.inputs.run_scout == 'true' && env.TARGET_IMAGE != '' }}
+      if: ${{ steps.target.outputs.is_image == 'true' && github.event.inputs.run_scout == 'true' }}
       continue-on-error: true
-      run: docker scout quickview "$TARGET_IMAGE" --output json > scout_output.json
+      run: docker scout quickview "${{ steps.target.outputs.target_image }}" \
+           --output json > scout_output.json
 
-    # ─────────────── 4. BUILD EXCEL SUMMARY ───────────────
-    - name: 🗃️  Build Excel summary
+    # --------------------------------------------------
+    # 4. BUILD EXCEL SUMMARY
+    # --------------------------------------------------
+    - name: 🗃️  Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: "3.11"
@@ -108,22 +119,25 @@ jobs:
       if: always()
       run: |
         python - <<'PY'
-        import json, glob, pandas as pd, pathlib, sys
-        outputs={}
+        import json, glob, pandas as pd, sys
+        sheets={}
         for f in glob.glob("*_output.json"):
             try:
                 data=json.load(open(f, encoding="utf-8"))
                 df=pd.json_normalize(data)
-                outputs[f.replace("_output.json","")]=df
+                sheets[f.replace("_output.json","")] = df
             except Exception as e:
-                print(f"⚠️ Skipped {f}: {e}", file=sys.stderr)
-        with pd.ExcelWriter("compliance_report.xlsx") as xl:
-            for name,df in outputs.items():
-                df.to_excel(xl, sheet_name=name[:31], index=False)
+                print("⚠️  skipped", f, e, file=sys.stderr)
+        if sheets:
+            with pd.ExcelWriter("compliance_report.xlsx") as xl:
+                for name,df in sheets.items():
+                    df.to_excel(xl, sheet_name=name[:31], index=False)
         PY
 
-    # ─────────────── 5. PUBLISH ARTEFACTS ───────────────
-    - name: 📤 Upload results
+    # --------------------------------------------------
+    # 5. PUBLISH RESULTS
+    # --------------------------------------------------
+    - name: 📤 Upload scan artefacts
       uses: actions/upload-artifact@v4
       with:
         name: oss-scan-results

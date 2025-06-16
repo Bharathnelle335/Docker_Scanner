@@ -27,6 +27,7 @@ jobs:
       IMG_NAME: loaded-image
     steps:
 
+    # ─────────────────────────── 1. INPUT ───────────────────────────
     - uses: actions/checkout@v4
 
     - name: ⬇️  Download ZIP
@@ -39,6 +40,7 @@ jobs:
       if: ${{ github.event.inputs.input_type == 'docker' }}
       run: docker pull "${{ github.event.inputs.docker_image }}"
 
+    # ────────────────── 2. Decide target & (maybe) load .tar ──────────────────
     - name: 📌 Decide scan target
       id: target
       run: |
@@ -54,6 +56,7 @@ jobs:
           echo "target_image=$IMG_NAME:latest" >>"$GITHUB_OUTPUT"
         fi
 
+    # ─────────────────────────── 3. Syft ───────────────────────────
     - name: 📝 Install Syft
       continue-on-error: true
       run: |
@@ -69,20 +72,9 @@ jobs:
           syft "${{ steps.target.outputs.target_dir }}"   -o json > syft_output.json
         fi
 
-    - name: 📝 Tern SBOM (images only)
-      if: ${{ steps.target.outputs.is_image == 'true' }}
-      continue-on-error: true
-      run: |
-        sudo apt update
-        sudo apt install -y python3.10 python3.10-venv
-        python3.10 -m venv tern-venv
-        source tern-venv/bin/activate
-        pip install --upgrade pip
-        pip install tern
-        tern report -i "${{ steps.target.outputs.target_image }}" -o tern_output.json
-
-    - name: 📝 SCANOSS file-level scan
-      continue-on-error: true
+    # ─────────────────────── 4. Prepare fsroot once ───────────────────────
+    - name: 🗂️  Prepare filesystem for file-level scanners
+      id: prepfs
       run: |
         mkdir fsroot
         if [[ "${{ steps.target.outputs.is_image }}" == "true" ]]; then
@@ -92,14 +84,30 @@ jobs:
         else
           cp -r "${{ steps.target.outputs.target_dir }}/." fsroot/
         fi
-        docker run --rm -v "$PWD/fsroot":/scan ghcr.io/scanoss/scanoss-toolkit scan           -o scanoss_output.json /scan
 
+    # ─────────────────────── 5. SCANOSS CLI ───────────────────────
+    - name: 📝 SCANOSS scan
+      continue-on-error: true
+      run: |
+        docker run --rm -v "$PWD/fsroot":/scan scanoss/scanoss-cli scan \
+          -o scanoss_output.json /scan
+
+    # ─────────────────────── 6. ScanCode Toolkit ───────────────────────
+    - name: 📝 ScanCode Toolkit
+      continue-on-error: true
+      run: |
+        docker run --rm -v "$PWD/fsroot":/code -v "$PWD":/out \
+          aboutcode/scancode-toolkit:latest \
+          --json-pp /out/scancode_output.json /code
+
+    # ─────────────────────── 7. Docker Scout (optional) ───────────────────────
     - name: 📝 Docker Scout (optional)
       if: ${{ steps.target.outputs.is_image == 'true' && github.event.inputs.run_scout == 'true' }}
       continue-on-error: true
       run: |
         docker scout quickview "${{ steps.target.outputs.target_image }}" --format json > scout_output.json
 
+    # ───────────────────────── 8. Excel summary ─────────────────────────
     - name: 🗃️  Set up Python
       uses: actions/setup-python@v5
       with:
@@ -126,14 +134,15 @@ jobs:
                     df.to_excel(xl, sheet_name=name[:31], index=False)
         PY
 
+    # ───────────────────────── 9. Upload artefacts ─────────────────────────
     - name: 📤 Upload artefacts
       uses: actions/upload-artifact@v4
       with:
         name: oss-scan-results
         path: |
           syft_output.json
-          tern_output.json
           scanoss_output.json
+          scancode_output.json
           scout_output.json
           compliance_report.xlsx
         if-no-files-found: ignore

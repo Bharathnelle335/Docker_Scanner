@@ -104,7 +104,8 @@ jobs:
     - name: 📝 SCANOSS scan
       continue-on-error: true
       run: |
-        docker run --rm -v "$PWD/fsroot":/scan scanoss/scanoss-toolkit:latest \
+        docker run --rm -v "$PWD/fsroot":/scan \
+          ghcr.io/scanoss/scanoss-toolkit:v3.6.6 \
           scan -o /scan/../scanoss_output.json /scan
 
     # ── 6. ScanCode Toolkit (Docker Hub image)
@@ -112,7 +113,7 @@ jobs:
       continue-on-error: true
       run: |
         docker run --rm -v "$PWD/fsroot":/code -v "$PWD":/out \
-          aboutcode/scancode-toolkit:latest \
+          nexb/scancode-toolkit:latest \
           --json-pp /out/scancode_output.json /code
 
     # ── 7. Docker Scout (optional)

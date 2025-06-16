@@ -115,19 +115,20 @@ jobs:
       if: always()
       run: |
         python - <<'PY'
-import json, glob, pandas as pd, sys
-sheets={}
-for f in glob.glob("*_output.json"):
-    try:
-        data=json.load(open(f, encoding="utf-8"))
-        sheets[f.replace("_output.json","")] = pd.json_normalize(data)
-    except Exception as e:
-        print("⚠️  skipped", f, e, file=sys.stderr)
-if sheets:
-    with pd.ExcelWriter("compliance_report.xlsx") as xl:
-        for name,df in sheets.items():
-            df.to_excel(xl, sheet_name=name[:31], index=False)
-PY
+        import json, glob, pandas as pd, sys
+        sheets = {}
+        for f in glob.glob("*_output.json"):
+            try:
+                with open(f, encoding="utf-8") as fp:
+                    data = json.load(fp)
+                sheets[f.replace("_output.json", "")] = pd.json_normalize(data)
+            except Exception as e:
+                print(f"⚠️  skipped {f}: {e}", file=sys.stderr)
+        if sheets:
+            with pd.ExcelWriter("compliance_report.xlsx") as xl:
+                for name, df in sheets.items():
+                    df.to_excel(xl, sheet_name=name[:31], index=False)
+        PY
 
     - name: 📤 Upload artefacts
       uses: actions/upload-artifact@v4
